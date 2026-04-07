@@ -701,7 +701,13 @@ export default function GroupsPage() {
 
                   if (parsed.system) {
                     return (
-                      <div key={`msg-${msg.id}`} ref={(el) => (itemRefs.current[msg.id] = el)} className="flex justify-center">
+                      <div
+                        key={`msg-${msg.id}`}
+                        ref={(el) => {
+                          itemRefs.current[msg.id] = el;
+                        }}
+                        className="flex justify-center"
+                      >
                         <div className="text-xs text-slate-500 bg-white border border-slate-200 px-3 py-1.5 rounded-full shadow-sm">
                           {highlightText(parsed.text || `${msg.user_email} left the group`, searchTerm)}
                         </div>
@@ -709,7 +715,13 @@ export default function GroupsPage() {
                     );
                   }
                   return (
-                    <div key={`msg-${msg.id}`} ref={(el) => (itemRefs.current[msg.id] = el)} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
+                    <div
+                      key={`msg-${msg.id}`}
+                      ref={(el) => {
+                        itemRefs.current[msg.id] = el;
+                      }}
+                      className={`flex ${isMine ? "justify-end" : "justify-start"}`}
+                    >
                       <div
                         className={`max-w-[72%] rounded-2xl px-4 py-3 border shadow-sm ${
                           isMine ? "bg-emerald-500 text-white border-emerald-400" : "bg-white text-slate-900 border-slate-200"
@@ -761,7 +773,13 @@ export default function GroupsPage() {
                 const doc = item.payload as DocumentItem;
                 const sharer = doc.shared_by_email || "Someone";
                 return (
-                  <div key={`shared-${doc.id}`} ref={(el) => (itemRefs.current[doc.id] = el)} className="flex justify-start">
+                  <div
+                    key={`shared-${doc.id}`}
+                    ref={(el) => {
+                      itemRefs.current[doc.id] = el;
+                    }}
+                    className="flex justify-start"
+                  >
                     <div className="max-w-[72%] rounded-2xl px-4 py-3 border shadow-sm bg-indigo-50 text-slate-900 border-indigo-100">
                       <div className="flex items-center gap-2 mb-1 text-indigo-700 text-xs font-semibold">
                         <FileText className="w-4 h-4" /> Shared PDF · {sharer}
