@@ -7,6 +7,12 @@ import {
   ChevronDown,
   Phone,
   Video,
+  VideoOff,
+  Mic,
+  MicOff,
+  Users,
+  MessageSquare,
+  PhoneOff,
   Paperclip,
   Image as ImageIcon,
   FileText,
@@ -56,6 +62,34 @@ type ParsedMessage = {
   text: string;
   attachments: Attachment[];
   system?: boolean;
+  kind?: string;
+  call?: {
+    room_id: string;
+    call_type?: "voice" | "video";
+    started_by?: string;
+    started_at?: string;
+    expires_at?: string;
+    ended_by?: string;
+    ended_at?: string;
+  };
+};
+
+type CallSession = {
+  roomId: string;
+  callType: "voice" | "video";
+  startedBy: string;
+};
+
+type RemoteVideo = {
+  peerId: string;
+  email: string;
+  stream: MediaStream;
+};
+
+type CallParticipant = {
+  peerId: string;
+  email: string;
+  status: "connected" | "joining";
 };
 
 type DocumentItem = {
@@ -79,8 +113,17 @@ export default function GroupsPage() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [callModal, setCallModal] = useState(false);
-  const [videoModal, setVideoModal] = useState(false);
+  const [startingCallType, setStartingCallType] = useState<"voice" | "video" | null>(null);
+  const [activeCall, setActiveCall] = useState<CallSession | null>(null);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteVideos, setRemoteVideos] = useState<RemoteVideo[]>([]);
+  const [callParticipants, setCallParticipants] = useState<CallParticipant[]>([]);
+  const [endingRoomId, setEndingRoomId] = useState<string | null>(null);
+  const [callError, setCallError] = useState<string | null>(null);
+  const [callSidebarTab, setCallSidebarTab] = useState<"participants" | "chat">("participants");
+  const [callDraftMessage, setCallDraftMessage] = useState("");
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [camEnabled, setCamEnabled] = useState(true);
   const [typingUsers, setTypingUsers] = useState<Record<string, number>>({});
   const [sending, setSending] = useState(false);
   const [sharedDocs, setSharedDocs] = useState<DocumentItem[]>([]);
@@ -106,6 +149,11 @@ export default function GroupsPage() {
   const token = typeof window !== "undefined" ? localStorage.getItem("sa_token") : null;
   const typingTimeout = useRef<NodeJS.Timeout | null>(null);
   const typingSourceRef = useRef<EventSource | null>(null);
+  const callSignalSourceRef = useRef<EventSource | null>(null);
+  const peerIdRef = useRef<string>(typeof crypto !== "undefined" ? crypto.randomUUID() : `${Date.now()}`);
+  const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>({});
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const sortedGroups = useMemo(() => {
     return [...groups].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -119,6 +167,8 @@ export default function GroupsPage() {
           text: parsed.text || "",
           attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
           system: Boolean((parsed as any).system),
+          kind: typeof (parsed as any).kind === "string" ? (parsed as any).kind : undefined,
+          call: (parsed as any).call,
         };
       }
     } catch (_) {
@@ -494,6 +544,207 @@ export default function GroupsPage() {
     }
   };
 
+  const handleStartCall = async (callType: "voice" | "video") => {
+    if (!selectedGroup || !token) return;
+    setError(null);
+    setStartingCallType(callType);
+
+    const res = await fetch(`${API_BASE}/groups/${selectedGroup.id}/calls/start`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ call_type: callType }),
+    }).catch(() => null);
+
+    setStartingCallType(null);
+    if (!res || !res.ok) {
+      setError("Failed to start group call");
+      return;
+    }
+
+    const msg = await res.json();
+    setMessages((prev) => [...prev, msg]);
+  };
+
+  const handleJoinCall = async (roomId: string) => {
+    if (!selectedGroup || !token) return;
+    setError(null);
+
+    const res = await fetch(`${API_BASE}/groups/${selectedGroup.id}/calls/join`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ room_id: roomId }),
+    }).catch(() => null);
+
+    if (!res || !res.ok) {
+      setError("Unable to join this call");
+      return;
+    }
+
+    const data = await res.json();
+    setActiveCall({ roomId: data.room_id, callType: data.call_type, startedBy: data.started_by });
+  };
+
+  const handleEndCall = async (roomId: string) => {
+    if (!selectedGroup || !token) return;
+    if (!isActiveCallHost) {
+      setError("Only the call creator can end this call for everyone.");
+      return;
+    }
+    setError(null);
+    setEndingRoomId(roomId);
+
+    const res = await fetch(`${API_BASE}/groups/${selectedGroup.id}/calls/end`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ room_id: roomId }),
+    }).catch(() => null);
+
+    if (!res || !res.ok) {
+      setEndingRoomId(null);
+      if (res?.status === 409) {
+        if (activeCall?.roomId === roomId) {
+          await leaveCallSession(false);
+        }
+        return;
+      }
+      if (res?.status === 403) {
+        setError("Only the call creator can end this call for everyone.");
+        return;
+      }
+      setError("Unable to end this call");
+      return;
+    }
+
+    const msg = await res.json();
+    setMessages((prev) => [...prev, msg]);
+    setEndingRoomId(null);
+
+    if (activeCall?.roomId === roomId) {
+      await leaveCallSession(false);
+    }
+  };
+
+  const sendSignal = async (
+    roomId: string,
+    signalType: "presence" | "offer" | "answer" | "ice" | "leave" | "end",
+    payload: Record<string, any>,
+    toPeerId?: string
+  ) => {
+    if (!selectedGroup || !token) return;
+    await fetch(`${API_BASE}/groups/${selectedGroup.id}/calls/signal`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        room_id: roomId,
+        from_peer_id: peerIdRef.current,
+        to_peer_id: toPeerId,
+        signal_type: signalType,
+        payload,
+      }),
+    }).catch(() => null);
+  };
+
+  const removeRemote = (peerId: string) => {
+    setRemoteVideos((prev) => prev.filter((v) => v.peerId !== peerId));
+    setCallParticipants((prev) => prev.filter((p) => p.peerId !== peerId));
+    const pc = peerConnectionsRef.current[peerId];
+    if (pc) {
+      pc.close();
+      delete peerConnectionsRef.current[peerId];
+    }
+  };
+
+  const ensurePeerConnection = (roomId: string, remotePeerId: string, remoteEmail: string) => {
+    const existing = peerConnectionsRef.current[remotePeerId];
+    if (existing) return existing;
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    const currentLocalStream = localStreamRef.current;
+    if (currentLocalStream) {
+      currentLocalStream.getTracks().forEach((track) => {
+        pc.addTrack(track, currentLocalStream);
+      });
+    }
+
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      sendSignal(roomId, "ice", { candidate: event.candidate }, remotePeerId);
+    };
+
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
+
+      setCallParticipants((prev) => {
+        const existing = prev.find((p) => p.peerId === remotePeerId);
+        if (existing) {
+          return prev.map((p) => (p.peerId === remotePeerId ? { ...p, status: "connected", email: remoteEmail } : p));
+        }
+        return [...prev, { peerId: remotePeerId, email: remoteEmail, status: "connected" }];
+      });
+
+      setRemoteVideos((prev) => {
+        const next = prev.filter((v) => v.peerId !== remotePeerId);
+        next.push({ peerId: remotePeerId, email: remoteEmail, stream });
+        return next;
+      });
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+        removeRemote(remotePeerId);
+      }
+    };
+
+    peerConnectionsRef.current[remotePeerId] = pc;
+    return pc;
+  };
+
+  const leaveCallSession = async (announceLeave: boolean) => {
+    if (announceLeave && activeCall) {
+      await sendSignal(activeCall.roomId, "leave", {});
+    }
+
+    if (callSignalSourceRef.current) {
+      callSignalSourceRef.current.close();
+      callSignalSourceRef.current = null;
+    }
+
+    Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
+    peerConnectionsRef.current = {};
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+    }
+
+    localStreamRef.current = null;
+    setLocalStream(null);
+    setRemoteVideos([]);
+    setCallParticipants([]);
+    setActiveCall(null);
+    setCallError(null);
+    setEndingRoomId(null);
+    setCallDraftMessage("");
+    setCallSidebarTab("participants");
+    setMicEnabled(true);
+    setCamEnabled(true);
+  };
+
   const typingDisplay = Object.keys(typingUsers).filter((email) => email !== user?.email);
 
   const mediaItems = useMemo(() => {
@@ -529,6 +780,201 @@ export default function GroupsPage() {
       })
       .filter(Boolean) as { id: string; type: string; snippet: string }[];
   }, [mergedFeed, searchTerm]);
+
+  const endedRoomIds = useMemo(() => {
+    const ended = new Set<string>();
+    messages.forEach((m) => {
+      const parsed = parseMessage(m.message);
+      if (parsed.kind === "call_end" && parsed.call?.room_id) {
+        ended.add(parsed.call.room_id);
+      }
+    });
+    return ended;
+  }, [messages]);
+
+  const callChatMessages = useMemo(() => {
+    return messages
+      .map((m) => {
+        const parsed = parseMessage(m.message);
+        if (parsed.system || !parsed.text?.trim()) return null;
+        return {
+          id: m.id,
+          email: m.user_email,
+          text: parsed.text,
+          createdAt: m.created_at,
+          mine: m.user_email.toLowerCase() === (user?.email || "").toLowerCase(),
+        };
+      })
+      .filter(Boolean)
+      .slice(-24) as { id: string; email: string; text: string; createdAt: string; mine: boolean }[];
+  }, [messages, user?.email]);
+
+  const isActiveCallHost = useMemo(() => {
+    if (!activeCall || !user?.email) return false;
+    return activeCall.startedBy.toLowerCase() === user.email.toLowerCase();
+  }, [activeCall, user?.email]);
+
+  useEffect(() => {
+    if (!localVideoRef.current || !localStream) return;
+    localVideoRef.current.srcObject = localStream;
+  }, [localStream]);
+
+  useEffect(() => {
+    if (!localStreamRef.current) return;
+    localStreamRef.current.getAudioTracks().forEach((track) => {
+      track.enabled = micEnabled;
+    });
+  }, [micEnabled]);
+
+  useEffect(() => {
+    if (!localStreamRef.current) return;
+    localStreamRef.current.getVideoTracks().forEach((track) => {
+      track.enabled = camEnabled;
+    });
+  }, [camEnabled]);
+
+  const sendCallMessage = async () => {
+    if (!selectedGroup || !token || !callDraftMessage.trim()) return;
+
+    const payload = JSON.stringify({ text: callDraftMessage.trim(), attachments: [] });
+    const res = await fetch(`${API_BASE}/groups/${selectedGroup.id}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: payload }),
+    }).catch(() => null);
+
+    if (!res || !res.ok) return;
+
+    const msg = await res.json();
+    setMessages((prev) => [...prev, msg]);
+    setCallDraftMessage("");
+  };
+
+  useEffect(() => {
+    if (!activeCall || !selectedGroup || !token) return;
+
+    let mounted = true;
+    let presenceInterval: NodeJS.Timeout | null = null;
+
+    const bootCall = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: activeCall.callType === "video",
+          audio: true,
+        });
+        if (!mounted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+        setCallParticipants([
+          {
+            peerId: peerIdRef.current,
+            email: user?.email || "You",
+            status: "connected",
+          },
+        ]);
+
+        const source = new EventSource(`${API_BASE}/groups/${selectedGroup.id}/calls/signal/stream?token=${token}`);
+        callSignalSourceRef.current = source;
+
+        source.onmessage = async (event) => {
+          if (!event.data) return;
+          let signal: any;
+          try {
+            signal = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+
+          try {
+            if (!signal?.room_id || signal.room_id !== activeCall.roomId) return;
+            if (signal.from_peer_id === peerIdRef.current) return;
+            if (signal.to_peer_id && signal.to_peer_id !== peerIdRef.current) return;
+
+            const remotePeerId = signal.from_peer_id as string;
+            const remoteEmail = signal.from_email || "Member";
+
+            if (signal.signal_type === "end") {
+              setCallError(`Call ended by ${signal.payload?.ended_by || remoteEmail}`);
+              await leaveCallSession(false);
+              return;
+            }
+
+            if (signal.signal_type === "leave") {
+              removeRemote(remotePeerId);
+              return;
+            }
+
+            setCallParticipants((prev) => {
+              const existing = prev.find((p) => p.peerId === remotePeerId);
+              if (existing) {
+                return prev.map((p) => (p.peerId === remotePeerId ? { ...p, email: remoteEmail } : p));
+              }
+              return [...prev, { peerId: remotePeerId, email: remoteEmail, status: "joining" }];
+            });
+
+            const pc = ensurePeerConnection(activeCall.roomId, remotePeerId, remoteEmail);
+
+            if (signal.signal_type === "presence") {
+              if (peerIdRef.current < remotePeerId) {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                await sendSignal(activeCall.roomId, "offer", { sdp: offer }, remotePeerId);
+              } else {
+                await sendSignal(activeCall.roomId, "presence", { ack: true }, remotePeerId);
+              }
+              return;
+            }
+
+            if (signal.signal_type === "offer" && signal.payload?.sdp) {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.payload.sdp));
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              await sendSignal(activeCall.roomId, "answer", { sdp: answer }, remotePeerId);
+              return;
+            }
+
+            if (signal.signal_type === "answer" && signal.payload?.sdp) {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.payload.sdp));
+              return;
+            }
+
+            if (signal.signal_type === "ice" && signal.payload?.candidate) {
+              await pc.addIceCandidate(new RTCIceCandidate(signal.payload.candidate));
+            }
+          } catch {
+            setCallError("Connection sync issue detected. Retrying participant discovery...");
+          }
+        };
+
+        source.onerror = () => {
+          source.close();
+        };
+
+        await sendSignal(activeCall.roomId, "presence", { at: new Date().toISOString() });
+        presenceInterval = setInterval(() => {
+          sendSignal(activeCall.roomId, "presence", { at: new Date().toISOString(), heartbeat: true }).catch(() => null);
+        }, 5000);
+      } catch {
+        setCallError("Camera/mic access failed. Please allow permissions and try again.");
+      }
+    };
+
+    bootCall();
+
+    return () => {
+      mounted = false;
+      if (presenceInterval) {
+        clearInterval(presenceInterval);
+      }
+      leaveCallSession(false);
+    };
+  }, [activeCall, selectedGroup?.id, token]);
 
   return (
     <main className="min-h-screen bg-[#f4f6fa] relative overflow-visible text-slate-800 font-sans p-4 md:p-8">
@@ -661,11 +1107,11 @@ export default function GroupsPage() {
                 </p>
               </div>
               <div className="flex items-center gap-2 relative">
-                <button className="w-9 h-9 rounded-full border border-slate-200 text-slate-700 hover:bg-slate-50" onClick={() => setCallModal(true)}>
-                  <Phone className="w-4 h-4 mx-auto" />
+                <button className="w-9 h-9 rounded-full border border-slate-200 text-slate-700 hover:bg-slate-50" onClick={() => handleStartCall("voice")}>
+                  {startingCallType === "voice" ? <Loader2 className="w-4 h-4 mx-auto animate-spin" /> : <Phone className="w-4 h-4 mx-auto" />}
                 </button>
-                <button className="w-9 h-9 rounded-full border border-slate-200 text-slate-700 hover:bg-slate-50" onClick={() => setVideoModal(true)}>
-                  <Video className="w-4 h-4 mx-auto" />
+                <button className="w-9 h-9 rounded-full border border-slate-200 text-slate-700 hover:bg-slate-50" onClick={() => handleStartCall("video")}>
+                  {startingCallType === "video" ? <Loader2 className="w-4 h-4 mx-auto animate-spin" /> : <Video className="w-4 h-4 mx-auto" />}
                 </button>
                 <button className={`w-9 h-9 rounded-full border ${rightOpen ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-200 text-slate-700"} hover:bg-slate-50`} onClick={() => setRightOpen((v) => !v)} aria-label="Toggle info panel">
                   <Info className="w-4 h-4 mx-auto" />
@@ -700,6 +1146,65 @@ export default function GroupsPage() {
                   const isMine = msg.user_email.toLowerCase() === (user?.email || "").toLowerCase();
 
                   if (parsed.system) {
+                    if (parsed.kind === "call_invite" && parsed.call?.room_id) {
+                      const isEnded = endedRoomIds.has(parsed.call.room_id);
+                      const startedByMe = parsed.call.started_by?.toLowerCase() === (user?.email || "").toLowerCase();
+                      return (
+                        <div
+                          key={`msg-${msg.id}`}
+                          ref={(el) => {
+                            itemRefs.current[msg.id] = el;
+                          }}
+                          className="flex justify-center"
+                        >
+                          <div className="w-full max-w-[560px] rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 shadow-sm">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-indigo-900">{parsed.call.call_type === "video" ? "Video call started" : "Voice call started"}</p>
+                                <p className="text-xs text-indigo-700 mt-0.5">{highlightText(parsed.text || "Group call invite", searchTerm)}</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {isEnded ? (
+                                  <span className="px-3 py-1.5 rounded-xl bg-slate-200 text-slate-700 text-xs font-semibold">Call Ended</span>
+                                ) : (
+                                  <>
+                                    <button
+                                      className="px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700"
+                                      onClick={() => handleJoinCall(parsed.call!.room_id)}
+                                    >
+                                      Join Call
+                                    </button>
+                                    {startedByMe && (
+                                      <button
+                                        className="px-3 py-1.5 rounded-xl bg-rose-600 text-white text-xs font-semibold hover:bg-rose-700"
+                                        onClick={() => handleEndCall(parsed.call!.room_id)}
+                                      >
+                                        End Call
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (parsed.kind === "call_end") {
+                      return (
+                        <div
+                          key={`msg-${msg.id}`}
+                          ref={(el) => {
+                            itemRefs.current[msg.id] = el;
+                          }}
+                          className="flex justify-center"
+                        >
+                          <div className="text-xs text-slate-600 bg-rose-50 border border-rose-200 px-3 py-1.5 rounded-full shadow-sm">
+                            {highlightText(parsed.text || "Call ended", searchTerm)}
+                          </div>
+                        </div>
+                      );
+                    }
                     return (
                       <div
                         key={`msg-${msg.id}`}
@@ -1202,26 +1707,194 @@ export default function GroupsPage() {
         </div>
       )}
 
-      {(callModal || videoModal) && (
-        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl border border-slate-100 max-w-md w-full p-6 space-y-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl bg-indigo-50 text-indigo-600">
-                <Info className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold text-slate-900">Feature under development</h3>
-                <p className="text-sm text-slate-600">Calls and video conferencing are coming soon.</p>
-              </div>
-            </div>
-            <div className="flex justify-end gap-2">
-              <button className="px-4 py-2 rounded-xl border border-slate-200" onClick={() => { setCallModal(false); setVideoModal(false); }}>
-                Close
-              </button>
+      {activeCall && (
+        <div className="fixed inset-0 z-50 bg-[#0f1624]">
+          <div className="relative h-full p-3 md:p-4">
+            <div className="h-full grid grid-cols-1 xl:grid-cols-[1fr_340px] gap-3">
+              <section className="rounded-3xl border border-white/15 bg-[#111a2b] text-white p-3 md:p-4 flex flex-col min-h-0">
+                <header className="flex items-start justify-between gap-3 pb-3 border-b border-white/10">
+                  <div>
+                    <p className="text-base font-semibold tracking-tight">{selectedGroup?.name || "Group call"}</p>
+                    <p className="text-xs text-white/70 mt-0.5">Room {activeCall.roomId} • {callParticipants.length} participants</p>
+                  </div>
+                  <button
+                    className="px-3 py-1.5 rounded-full bg-white/10 text-xs font-semibold hover:bg-white/20"
+                    onClick={() => leaveCallSession(true)}
+                  >
+                    Leave
+                  </button>
+                </header>
+
+                {callError && (
+                  <div className="mt-3 rounded-xl border border-rose-400/40 bg-rose-500/20 px-3 py-2 text-sm text-rose-100">
+                    {callError}
+                  </div>
+                )}
+
+                <div className="flex-1 min-h-0 overflow-auto mt-3">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 auto-rows-[minmax(210px,1fr)]">
+                    <div className="rounded-3xl overflow-hidden bg-[#0b111d] border border-white/10 relative min-h-[220px]">
+                      <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover ${camEnabled ? "" : "opacity-25"}`} />
+                      {!camEnabled && (
+                        <div className="absolute inset-0 flex items-center justify-center text-white/70 text-sm font-medium">Camera off</div>
+                      )}
+                      <span className="absolute left-3 bottom-3 text-xs bg-black/55 px-2.5 py-1 rounded-full">{user?.email || "You"} (You)</span>
+                    </div>
+
+                    {remoteVideos.map((remote) => (
+                      <div key={remote.peerId} className="rounded-3xl overflow-hidden bg-[#0b111d] border border-white/10 relative min-h-[220px]">
+                        <video
+                          autoPlay
+                          playsInline
+                          className="w-full h-full object-cover"
+                          ref={(el) => {
+                            if (!el) return;
+                            el.srcObject = remote.stream;
+                          }}
+                        />
+                        <span className="absolute left-3 bottom-3 text-xs bg-black/55 px-2.5 py-1 rounded-full">{remote.email}</span>
+                      </div>
+                    ))}
+
+                    {remoteVideos.length === 0 && (
+                      <div className="rounded-3xl border border-dashed border-white/20 bg-white/5 min-h-[220px] flex items-center justify-center text-white/70 text-sm">
+                        Waiting for members to join...
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="pt-4 pb-1">
+                  <div className="mx-auto w-full max-w-2xl rounded-2xl border border-slate-300 bg-white text-slate-900 shadow-2xl px-3 py-2 flex flex-wrap items-center justify-center gap-2">
+                    <button
+                      className={`h-11 px-3 rounded-xl flex items-center justify-center gap-2 border font-semibold ${micEnabled ? "bg-slate-100 !text-slate-900 border-slate-300 hover:bg-slate-200" : "bg-amber-500 !text-white border-amber-500"}`}
+                      onClick={() => setMicEnabled((v) => !v)}
+                      title={micEnabled ? "Mute microphone" : "Unmute microphone"}
+                    >
+                      {micEnabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+                      <span className={`text-xs ${micEnabled ? "!text-slate-900" : "!text-white"}`}>{micEnabled ? "Mic On" : "Mic Off"}</span>
+                    </button>
+                    <button
+                      className={`h-11 px-3 rounded-xl flex items-center justify-center gap-2 border font-semibold ${camEnabled ? "bg-slate-100 !text-slate-900 border-slate-300 hover:bg-slate-200" : "bg-amber-500 !text-white border-amber-500"}`}
+                      onClick={() => setCamEnabled((v) => !v)}
+                      title={camEnabled ? "Turn camera off" : "Turn camera on"}
+                    >
+                      {camEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+                      <span className={`text-xs ${camEnabled ? "!text-slate-900" : "!text-white"}`}>{camEnabled ? "Cam On" : "Cam Off"}</span>
+                    </button>
+                    <button
+                      className={`h-11 px-3 rounded-xl flex items-center justify-center gap-2 border font-semibold ${callSidebarTab === "participants" ? "bg-sky-600 !text-white border-sky-600" : "bg-slate-100 !text-slate-900 border-slate-300 hover:bg-slate-200"}`}
+                      onClick={() => setCallSidebarTab("participants")}
+                      title="Participants"
+                    >
+                      <Users className="w-5 h-5" />
+                      <span className={`text-xs ${callSidebarTab === "participants" ? "!text-white" : "!text-slate-900"}`}>Participants</span>
+                    </button>
+                    <button
+                      className={`h-11 px-3 rounded-xl flex items-center justify-center gap-2 border font-semibold ${callSidebarTab === "chat" ? "bg-sky-600 !text-white border-sky-600" : "bg-slate-100 !text-slate-900 border-slate-300 hover:bg-slate-200"}`}
+                      onClick={() => setCallSidebarTab("chat")}
+                      title="Chat"
+                    >
+                      <MessageSquare className="w-5 h-5" />
+                      <span className={`text-xs ${callSidebarTab === "chat" ? "!text-white" : "!text-slate-900"}`}>Chat</span>
+                    </button>
+                    <button
+                      className="h-11 px-3 rounded-xl bg-rose-600 text-white flex items-center justify-center gap-2 hover:bg-rose-700 disabled:bg-rose-300 disabled:text-white disabled:opacity-100 disabled:cursor-not-allowed"
+                      onClick={() => handleEndCall(activeCall.roomId)}
+                      disabled={!isActiveCallHost || endingRoomId === activeCall.roomId}
+                      title="End meeting for all"
+                    >
+                      <PhoneOff className="w-5 h-5" />
+                      <span className="text-xs font-semibold">{endingRoomId === activeCall.roomId ? "Ending..." : "End For All"}</span>
+                    </button>
+                  </div>
+                  {!isActiveCallHost && <p className="mt-2 text-center text-xs text-white font-medium">Only {activeCall.startedBy} can end this meeting for everyone.</p>}
+                </div>
+              </section>
+
+              <aside className="rounded-3xl border border-slate-300 bg-[#eef3fa] text-slate-900 overflow-hidden flex flex-col min-h-0" style={{ color: "#0f172a" }}>
+                <div className="px-4 py-4 border-b border-slate-300/70">
+                  <p className="text-lg font-semibold leading-tight text-slate-900">{selectedGroup?.name || "Group Call"}</p>
+                  <p className="text-xs text-slate-700 mt-1 font-medium">{callParticipants.length} participants</p>
+                </div>
+
+                <div className="px-3 pt-3">
+                  <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-200 p-1 text-xs font-semibold">
+                    <button
+                      className={`px-3 py-2 rounded-lg border ${callSidebarTab === "participants" ? "bg-white text-slate-900 border-slate-300" : "bg-slate-200 text-slate-700 border-transparent"}`}
+                      onClick={() => setCallSidebarTab("participants")}
+                    >
+                      Participants
+                    </button>
+                    <button
+                      className={`px-3 py-2 rounded-lg border ${callSidebarTab === "chat" ? "bg-white text-slate-900 border-slate-300" : "bg-slate-200 text-slate-700 border-transparent"}`}
+                      onClick={() => setCallSidebarTab("chat")}
+                    >
+                      Chat
+                    </button>
+                  </div>
+                </div>
+
+                {callSidebarTab === "participants" ? (
+                  <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
+                    {callParticipants.map((p) => (
+                      <div key={p.peerId} className="rounded-xl bg-white border border-slate-300 p-3 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-slate-800 truncate">{p.email}</p>
+                          <p className="text-xs text-slate-500">{p.peerId === peerIdRef.current ? "Host" : "Member"}</p>
+                        </div>
+                        <span className={`text-[11px] px-2 py-1 rounded-full font-semibold ${p.status === "connected" ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                          {p.status === "connected" ? "Connected" : "Waiting"}
+                        </span>
+                      </div>
+                    ))}
+                    {callParticipants.length === 0 && <p className="text-sm text-slate-500">No participants yet.</p>}
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
+                      {callChatMessages.map((msg) => (
+                        <div key={msg.id} className={`rounded-xl p-3 text-sm ${msg.mine ? "bg-blue-600 text-white ml-6" : "bg-white border border-slate-300 text-slate-900 mr-6"}`}>
+                          <div className={`text-[11px] mb-1 ${msg.mine ? "text-blue-100" : "text-slate-500"}`}>
+                            {msg.mine ? "You" : msg.email} • {new Date(msg.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                          </div>
+                          <p className="leading-relaxed">{msg.text}</p>
+                        </div>
+                      ))}
+                      {callChatMessages.length === 0 && <p className="text-sm text-slate-500">No chat messages yet.</p>}
+                    </div>
+
+                    <div className="p-3 border-t border-slate-300/70">
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={callDraftMessage}
+                          onChange={(e) => setCallDraftMessage(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              sendCallMessage();
+                            }
+                          }}
+                          className="flex-1 rounded-xl border border-slate-400 bg-white text-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"
+                          placeholder="Send a message..."
+                        />
+                        <button
+                          className="w-9 h-9 rounded-full bg-sky-600 text-white flex items-center justify-center hover:bg-sky-700"
+                          onClick={sendCallMessage}
+                          aria-label="Send call chat message"
+                        >
+                          <Send className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </aside>
             </div>
           </div>
         </div>
       )}
+
     </main>
   );
 }
